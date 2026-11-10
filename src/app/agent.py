@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import re
@@ -6,7 +7,6 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, dynamic_prompt
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.memory import InMemorySaver
 
 from app.context import Ctx
 from app.custom_tools import build_custom_tools
@@ -34,8 +34,8 @@ DATA AND CHARTS
 - sql_query/pandas_query return a data_ref: pass it to make_chart, never retype rows. Let make_chart aggregate (Altair shorthand such as "mean(Sales):Q").
 - Charts appear in the UI automatically: don't mention file paths or links."""
 
-CHART_RE = re.compile(r"(chart_[0-9a-f]+\.html)")
 
+CHART_RE = re.compile(r"(chart_[0-9a-f]+\.html)")
 
 OLD_RESULT_CHARS = 300
 
@@ -43,10 +43,23 @@ OLD_RESULT_CHARS = 300
 def shrink_old_tool_results(messages: list) -> list:
     """Context hygiene: tool results from EARLIER turns shrink to a stub. The assistant's answer already used them,
     and a thread that keeps every passage and query result grows past the model's per-request limit within a few turns."""
-    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=0)
+    last_human = max(
+        (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)),
+        default=0,
+    )
     return [
-        m.model_copy(update={"content": f"{m.content[:OLD_RESULT_CHARS]} ...[older tool result shortened]"})
-        if isinstance(m, ToolMessage) and i < last_human and isinstance(m.content, str) and len(m.content) > OLD_RESULT_CHARS else m
+        m.model_copy(
+            update={
+                "content": (
+                    f"{m.content[:OLD_RESULT_CHARS]} ...[older tool result shortened]"
+                )
+            }
+        )
+        if isinstance(m, ToolMessage)
+        and i < last_human
+        and isinstance(m.content, str)
+        and len(m.content) > OLD_RESULT_CHARS
+        else m
         for i, m in enumerate(messages)
     ]
 
@@ -55,23 +68,42 @@ class ShrinkOldToolResults(AgentMiddleware):
     """Applies shrink_old_tool_results to what is SENT to the model; the stored thread is unchanged."""
 
     def wrap_model_call(self, request, handler):
-        return handler(request.override(messages=shrink_old_tool_results(request.messages)))
+        return handler(
+            request.override(
+                messages=shrink_old_tool_results(request.messages)
+            )
+        )
 
     async def awrap_model_call(self, request, handler):
-        return await handler(request.override(messages=shrink_old_tool_results(request.messages)))
+        return await handler(
+            request.override(
+                messages=shrink_old_tool_results(request.messages)
+            )
+        )
 
 
 async def mcp_tools():
-    """MCP tools become ordinary LangChain tools. The notes and tasks server (src/app/mcp_server/server.py) is reached over HTTP at
-    MCP_URL (docker compose and CI start it). Retries a few times: the server may still be starting.
+    """Load MCP tools and forward the authenticated user's token privately."""
 
-    TODO(task 9): make every MCP call run AS THE LOGGED-IN USER. The server reads `Authorization: Bearer <token>`. Write a tool
-    interceptor (langchain-mcp-adapters: `async def interceptor(request, handler)`; `request.runtime.context` is this request's Ctx,
-    `request.override(headers={...})` returns a request with extra HTTP headers) and pass it as tool_interceptors=[...] below.
-    The token comes from Ctx (task 9: add `token` to Ctx, /agent fills it from the Authorization header). The model never sees it.
-    """
+    async def interceptor(request, handler):
+        runtime = request.runtime
+        context = getattr(runtime, "context", None)
+        token = getattr(context, "token", "") if context is not None else ""
+
+        if not token:
+            raise RuntimeError("Authenticated MCP request is missing its token.")
+
+        authenticated_request = request.override(
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        return await handler(authenticated_request)
+
     url = os.getenv("MCP_URL", "http://localhost:9000/mcp")
-    client = MultiServerMCPClient({"tasks": {"url": url, "transport": "streamable_http"}})  # TODO(task 9): tool_interceptors=[...]
+    client = MultiServerMCPClient(
+        {"tasks": {"url": url, "transport": "streamable_http"}},
+        tool_interceptors=[interceptor],
+    )
+
     for attempt in range(15):
         try:
             return await client.get_tools()
@@ -82,39 +114,61 @@ async def mcp_tools():
 
 
 async def build_agent(kb: KnowledgeBase, model=agent_llm, checkpointer=None):
-    """TODO(task 1): define the agent. main.py calls `agent, tools = await build_agent(kb, checkpointer=checkpointer)`.
-
-    What is here is a bare agent: Session 1 tools only, one fixed prompt, no memory. Build the real one, in this order:
-
-      1. TOOLS: one list with all these tools (the grader needs the first two groups now; the other two groups fill up as you finish tasks 7 to 9)
-           S1_TOOLS (7)                      get_weather web_fetch sql_query make_chart openml_search openml_download pandas_query
-           build_kb_tools(kb) (2)            ingest_document search_knowledge_base
-           await mcp_tools() (8)             add_note list_notes delete_note add_task list_tasks set_task_status delete_task task_summary
-           build_custom_tools(kb) (4)        kb_stats document_outline delete_document update_document   (you write them: tasks 7 and 8)
-      2. DYNAMIC PROMPT: a @dynamic_prompt function returning f"{SYSTEM_PROMPT}\n\n{kb.prompt_block(<kb id>)}" so that the model
-         sees the CURRENT knowledge base on every model call (what was uploaded, keywords, exact file names). `request.runtime.context`
-         is the Ctx of this request. (Which id? For now the chat's `request.runtime.context.session_id`; task 6 switches it to the USER: `request.runtime.context.user_id`.)
-      3. MIDDLEWARE: [your dynamic prompt, ShrinkOldToolResults()]
-      4. CONTEXT: context_schema=Ctx, so tools can read `runtime.context.session_id`
-      5. MEMORY: checkpointer=checkpointer (task 3), so each thread_id keeps its own conversation
-      6. return `agent, tools`   (the TOOL OBJECTS; main.py builds /health and /debug/tools from them)
+    """Build the agent with all available tools, dynamic knowledge-base context,
+    middleware, and optional conversation memory.
     """
-    tools = [*S1_TOOLS]  # TODO(task 1.1)
-    agent = create_agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)  # TODO(task 1.2 - 1.5)
+
+    tools = [
+        *S1_TOOLS,
+        *build_kb_tools(kb),
+        *await mcp_tools(),
+        *build_custom_tools(kb),
+    ]
+
+    @dynamic_prompt
+    def knowledge_base_prompt(request):
+        user_id = request.runtime.context.user_id
+        return f"{SYSTEM_PROMPT}\n\n{kb.prompt_block(user_id)}"
+
+    agent = create_agent(
+        model=model,
+        tools=tools,
+        middleware=[
+            knowledge_base_prompt,
+            ShrinkOldToolResults(),
+        ],
+        context_schema=Ctx,
+        checkpointer=checkpointer,
+    )
+
     return agent, tools
 
 
 def clean_answer(text: str) -> str:
     """Models sometimes swap '-' for typographic hyphens (U+2010/U+2011) inside file names, or wrap a citation in CJK
     brackets 【…】, so it would no longer match the stored document name / citation format. Normalise them back."""
-    return text.replace("\u2010", "-").replace("\u2011", "-").replace("\u3010", "[").replace("\u3011", "]")
+    return (
+        text.replace("\u2010", "-")
+        .replace("\u2011", "-")
+        .replace("\u3010", "[")
+        .replace("\u3011", "]")
+    )
 
 
 def steps_from(messages: list) -> list[dict]:
     """Pair each tool call with its result so the UI can show the reasoning trail."""
-    results = {m.tool_call_id: str(m.content) for m in messages if isinstance(m, ToolMessage)}
+    results = {
+        m.tool_call_id: str(m.content)
+        for m in messages
+        if isinstance(m, ToolMessage)
+    }
+
     return [
-        {"tool": c["name"], "args": c["args"], "result": results.get(c["id"], "")[:700]}
+        {
+            "tool": c["name"],
+            "args": c["args"],
+            "result": results.get(c["id"], "")[:700],
+        }
         for m in messages
         if isinstance(m, AIMessage)
         for c in m.tool_calls
@@ -126,5 +180,7 @@ def charts_from(messages: list) -> list[str]:
     return [
         f"/charts/{m.group(1)}"
         for t in messages
-        if isinstance(t, ToolMessage) and t.name == "make_chart" and (m := CHART_RE.search(str(t.content)))
+        if isinstance(t, ToolMessage)
+        and t.name == "make_chart"
+        and (m := CHART_RE.search(str(t.content)))
     ]
